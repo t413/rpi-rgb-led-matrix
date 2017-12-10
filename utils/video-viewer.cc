@@ -128,6 +128,32 @@ int main(int argc, char *argv[]) {
     return usage(argv[0]);
   }
 
+  runtime_opt.do_gpio_init = (stream_output == NULL);
+  RGBMatrix *matrix = CreateMatrixFromOptions(matrix_options, runtime_opt);
+  if (matrix == NULL) return 1;
+
+  if (large_display)
+    // Mapping the coordinates of a 32x128 display mapped to a square of 64x64,
+    // or any other U-shape.
+    matrix->ApplyStaticTransformer(rgb_matrix::UArrangementTransformer(
+                                     matrix_options.parallel));
+
+  if (angle >= -360)
+    matrix->ApplyStaticTransformer(rgb_matrix::RotateTransformer(angle));
+
+  FrameCanvas *offscreen_canvas = matrix->CreateFrameCanvas();
+  StreamIO *stream_io = NULL;
+  StreamWriter *stream_writer = NULL;
+  if (stream_output) {
+    int fd = open(stream_output, O_CREAT|O_WRONLY, 0644);
+    if (fd < 0) {
+      perror("Couldn't open output stream");
+      return 1;
+    }
+    stream_io = new rgb_matrix::FileStreamIO(fd);
+    stream_writer = new StreamWriter(stream_io);
+  }
+
   // Initalizing these to NULL prevents segfaults!
   AVFormatContext   *pFormatCtx = NULL;
   int               i, videoStream;
@@ -142,185 +168,170 @@ int main(int argc, char *argv[]) {
   uint8_t           *buffer = NULL;
   struct SwsContext *sws_ctx = NULL;
 
-  const char *movie_file = argv[optind];
-
   // Register all formats and codecs
   av_register_all();
   avformat_network_init();
 
-  // Open video file
-  if(avformat_open_input(&pFormatCtx, movie_file, NULL, NULL)!=0)
-    return -1; // Couldn't open file
+  for (int imgarg = optind; imgarg < argc; ++imgarg) {
+    const char *movie_file = argv[imgarg];
 
-  // Retrieve stream information
-  if(avformat_find_stream_info(pFormatCtx, NULL)<0)
-    return -1; // Couldn't find stream information
+    // Open video file
+    if(avformat_open_input(&pFormatCtx, movie_file, NULL, NULL)!=0) {
+      fprintf(stderr, "Couldn't open file %s\n", movie_file);
+      continue;
+    }
+    fprintf(stderr, "Playing %s\n", movie_file);
 
-  // Dump information about file onto standard error
-  if (verbose) {
-    av_dump_format(pFormatCtx, 0, movie_file, 0);
-  }
+    // Retrieve stream information
+    if(avformat_find_stream_info(pFormatCtx, NULL)<0)
+      return -1; // Couldn't find stream information
 
-  long frame_count = 0;
-  runtime_opt.do_gpio_init = (stream_output == NULL);
-  RGBMatrix *matrix = CreateMatrixFromOptions(matrix_options, runtime_opt);
-  if (matrix == NULL) {
-    return 1;
-  }
-  if (large_display) {
-    // Mapping the coordinates of a 32x128 display mapped to a square of 64x64,
-    // or any other U-shape.
-    matrix->ApplyStaticTransformer(rgb_matrix::UArrangementTransformer(
-                                     matrix_options.parallel));
-  }
+    // Dump information about file onto standard error
+    if (verbose) {
+      av_dump_format(pFormatCtx, 0, movie_file, 0);
+    }
 
-  if (angle >= -360) {
-    matrix->ApplyStaticTransformer(rgb_matrix::RotateTransformer(angle));
-  }
+    long frame_count = 0;
+    // Find the first video stream
+    videoStream=-1;
+    for (i=0; i < (int)pFormatCtx->nb_streams; ++i) {
+      if (pFormatCtx->streams[i]->codec->codec_type==AVMEDIA_TYPE_VIDEO) {
+        videoStream=i;
+        break;
+      }
+    }
+    if (videoStream == -1)
+      return -1; // Didn't find a video stream
 
-  FrameCanvas *offscreen_canvas = matrix->CreateFrameCanvas();
-  StreamIO *stream_io = NULL;
-  StreamWriter *stream_writer = NULL;
-  if (stream_output) {
-    int fd = open(stream_output, O_CREAT|O_WRONLY, 0644);
-    if (fd < 0) {
-      perror("Couldn't open output stream");
+    // Get a pointer to the codec context for the video stream
+    pCodecCtxOrig = pFormatCtx->streams[videoStream]->codec;
+    double fps = av_q2d(pFormatCtx->streams[videoStream]->avg_frame_rate);
+    if (fps < 0) {
+      fps = 1.0 / av_q2d(pFormatCtx->streams[videoStream]->codec->time_base);
+    }
+    if (verbose) fprintf(stderr, "FPS: %f\n", fps);
+
+    // Find the decoder for the video stream
+    pCodec=avcodec_find_decoder(pCodecCtxOrig->codec_id);
+    if (pCodec==NULL) {
+      fprintf(stderr, "Unsupported codec!\n");
+      continue;
+    }
+    // Copy context
+    pCodecCtx = avcodec_alloc_context3(pCodec);
+    if (avcodec_copy_context(pCodecCtx, pCodecCtxOrig) != 0) {
+      fprintf(stderr, "Couldn't copy codec context");
+      continue;
+    }
+
+    // Open codec
+    if (avcodec_open2(pCodecCtx, pCodec, NULL)<0)
+      continue;
+
+    // Allocate video frame
+    pFrame=av_frame_alloc();
+
+    // Allocate an AVFrame structure
+    pFrameRGB=av_frame_alloc();
+    if (pFrameRGB==NULL)
+      continue;
+
+    // Determine required buffer size and allocate buffer
+    numBytes=avpicture_get_size(AV_PIX_FMT_RGB24, pCodecCtx->width,
+                                pCodecCtx->height);
+    buffer=(uint8_t *)av_malloc(numBytes*sizeof(uint8_t));
+
+    // Assign appropriate parts of buffer to image planes in pFrameRGB
+    // Note that pFrameRGB is an AVFrame, but AVFrame is a superset
+    // of AVPicture
+    avpicture_fill((AVPicture *)pFrameRGB, buffer, AV_PIX_FMT_RGB24,
+                   pCodecCtx->width, pCodecCtx->height);
+
+    // initialize SWS context for software scaling
+    sws_ctx = sws_getContext(pCodecCtx->width,
+                             pCodecCtx->height,
+                             pCodecCtx->pix_fmt,
+                             matrix->width(), matrix->height(),
+                             AV_PIX_FMT_RGB24,
+                             SWS_BILINEAR,
+                             NULL,
+                             NULL,
+                             NULL
+                             );
+    if (sws_ctx == 0) {
+      fprintf(stderr, "Trouble doing scaling to %dx%d :(\n",
+              matrix->width(), matrix->height());
       return 1;
     }
-    stream_io = new rgb_matrix::FileStreamIO(fd);
-    stream_writer = new StreamWriter(stream_io);
-  }
-  // Find the first video stream
-  videoStream=-1;
-  for (i=0; i < (int)pFormatCtx->nb_streams; ++i) {
-    if (pFormatCtx->streams[i]->codec->codec_type==AVMEDIA_TYPE_VIDEO) {
-      videoStream=i;
+
+    signal(SIGTERM, InterruptHandler);
+    signal(SIGINT, InterruptHandler);
+
+    const int frame_wait_micros = 1e6 / fps;
+
+    const tmillis_t startPlay = GetTimeInMillis(); //mark time
+    int repeatedcount = 0;
+    do {
+      frame_count = 0;
+      while (!interrupt_received && av_read_frame(pFormatCtx, &packet) >= 0) {
+        // Is this a packet from the video stream?
+        if (packet.stream_index==videoStream) {
+          // Decode video frame
+          avcodec_decode_video2(pCodecCtx, pFrame, &frameFinished, &packet);
+
+          // Did we get a video frame?
+          if (frameFinished) {
+            // Convert the image from its native format to RGB
+            sws_scale(sws_ctx, (uint8_t const * const *)pFrame->data,
+                      pFrame->linesize, 0, pCodecCtx->height,
+                      pFrameRGB->data, pFrameRGB->linesize);
+
+            CopyFrame(pFrameRGB, offscreen_canvas);
+            frame_count++;
+            if (stream_writer) {
+              stream_writer->Stream(*offscreen_canvas, frame_wait_micros);
+            } else {
+              offscreen_canvas = matrix->SwapOnVSync(offscreen_canvas);
+            }
+          }
+          if (!stream_writer) usleep(frame_wait_micros);
+        }
+
+        // Free the packet that was allocated by av_read_frame
+        av_free_packet(&packet);
+      }
+      if ((GetTimeInMillis() - startPlay) < (repeatSeconds * 1000) && !av_seek_frame(pFormatCtx, -1, 1, AVSEEK_FLAG_FRAME)) {
+        if (repeatedcount)
+          fprintf(stderr, "finished loop %d (%ld frames) after %0.1fs\n", repeatedcount, frame_count, (GetTimeInMillis() - startPlay) / 1000.);
+        repeatedcount++;
+        continue;
+      } else break;
+    } while (!interrupt_received);
+
+    if (interrupt_received) {
+      // Feedback for Ctrl-C, but most importantly, force a newline
+      // at the output, so that commandline-shell editing is not messed up.
+      fprintf(stderr, "Got interrupt. Exiting\n");
       break;
     }
+
+    // Free the RGB image
+    av_free(buffer);
+    av_frame_free(&pFrameRGB);
+
+    // Free the YUV frame
+    av_frame_free(&pFrame);
+
+    // Close the codecs
+    avcodec_close(pCodecCtx);
+    avcodec_close(pCodecCtxOrig);
+
+    // Close the video file
+    avformat_close_input(&pFormatCtx);
+
+    delete stream_writer;
+    delete stream_io;
+    fprintf(stderr, "Finished playing %s - %ld frames for %0.1fs\n", movie_file, frame_count, (GetTimeInMillis() - startPlay) / 1000.);
   }
-  if (videoStream == -1)
-    return -1; // Didn't find a video stream
-
-  // Get a pointer to the codec context for the video stream
-  pCodecCtxOrig = pFormatCtx->streams[videoStream]->codec;
-  double fps = av_q2d(pFormatCtx->streams[videoStream]->avg_frame_rate);
-  if (fps < 0) {
-    fps = 1.0 / av_q2d(pFormatCtx->streams[videoStream]->codec->time_base);
-  }
-  if (verbose) fprintf(stderr, "FPS: %f\n", fps);
-
-  // Find the decoder for the video stream
-  pCodec=avcodec_find_decoder(pCodecCtxOrig->codec_id);
-  if (pCodec==NULL) {
-    fprintf(stderr, "Unsupported codec!\n");
-    return -1;
-  }
-  // Copy context
-  pCodecCtx = avcodec_alloc_context3(pCodec);
-  if (avcodec_copy_context(pCodecCtx, pCodecCtxOrig) != 0) {
-    fprintf(stderr, "Couldn't copy codec context");
-    return -1;
-  }
-
-  // Open codec
-  if (avcodec_open2(pCodecCtx, pCodec, NULL)<0)
-    return -1;
-
-  // Allocate video frame
-  pFrame=av_frame_alloc();
-
-  // Allocate an AVFrame structure
-  pFrameRGB=av_frame_alloc();
-  if (pFrameRGB==NULL)
-    return -1;
-
-  // Determine required buffer size and allocate buffer
-  numBytes=avpicture_get_size(AV_PIX_FMT_RGB24, pCodecCtx->width,
-                              pCodecCtx->height);
-  buffer=(uint8_t *)av_malloc(numBytes*sizeof(uint8_t));
-
-  // Assign appropriate parts of buffer to image planes in pFrameRGB
-  // Note that pFrameRGB is an AVFrame, but AVFrame is a superset
-  // of AVPicture
-  avpicture_fill((AVPicture *)pFrameRGB, buffer, AV_PIX_FMT_RGB24,
-                 pCodecCtx->width, pCodecCtx->height);
-
-  // initialize SWS context for software scaling
-  sws_ctx = sws_getContext(pCodecCtx->width,
-                           pCodecCtx->height,
-                           pCodecCtx->pix_fmt,
-                           matrix->width(), matrix->height(),
-                           AV_PIX_FMT_RGB24,
-                           SWS_BILINEAR,
-                           NULL,
-                           NULL,
-                           NULL
-                           );
-  if (sws_ctx == 0) {
-    fprintf(stderr, "Trouble doing scaling to %dx%d :(\n",
-            matrix->width(), matrix->height());
-    return 1;
-  }
-
-  signal(SIGTERM, InterruptHandler);
-  signal(SIGINT, InterruptHandler);
-
-  const int frame_wait_micros = 1e6 / fps;
-  
-  const tmillis_t startPlay = GetTimeInMillis();
-  do {
-    while (!interrupt_received && av_read_frame(pFormatCtx, &packet) >= 0) {
-      // Is this a packet from the video stream?
-      if (packet.stream_index==videoStream) {
-        // Decode video frame
-        avcodec_decode_video2(pCodecCtx, pFrame, &frameFinished, &packet);
-
-        // Did we get a video frame?
-        if (frameFinished) {
-          // Convert the image from its native format to RGB
-          sws_scale(sws_ctx, (uint8_t const * const *)pFrame->data,
-                    pFrame->linesize, 0, pCodecCtx->height,
-                    pFrameRGB->data, pFrameRGB->linesize);
-
-          CopyFrame(pFrameRGB, offscreen_canvas);
-          frame_count++;
-          if (stream_writer) {
-            stream_writer->Stream(*offscreen_canvas, frame_wait_micros);
-          } else {
-            offscreen_canvas = matrix->SwapOnVSync(offscreen_canvas);
-          }
-        }
-        if (!stream_writer) usleep(frame_wait_micros);
-      }
-
-      // Free the packet that was allocated by av_read_frame
-      av_free_packet(&packet);
-    }
-  } while ((GetTimeInMillis() - startPlay) < repeatSeconds);
-
-  if (interrupt_received) {
-    // Feedback for Ctrl-C, but most importantly, force a newline
-    // at the output, so that commandline-shell editing is not messed up.
-    fprintf(stderr, "Got interrupt. Exiting\n");
-  }
-
-  // Free the RGB image
-  av_free(buffer);
-  av_frame_free(&pFrameRGB);
-
-  // Free the YUV frame
-  av_frame_free(&pFrame);
-
-  // Close the codecs
-  avcodec_close(pCodecCtx);
-  avcodec_close(pCodecCtxOrig);
-
-  // Close the video file
-  avformat_close_input(&pFormatCtx);
-
-  delete stream_writer;
-  delete stream_io;
-  fprintf(stderr, "Total of %ld frames decoded\n", frame_count);
-
   return 0;
 }
