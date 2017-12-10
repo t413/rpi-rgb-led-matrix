@@ -8,3 +8,6 @@ minimal-example
 text-example
 *.dll
 *.exe
+examples-api-use/c-example
+examples-api-use/clock
+utils/video-viewer

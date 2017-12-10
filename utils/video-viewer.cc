@@ -21,6 +21,7 @@ extern "C" {
 #include <signal.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -31,6 +32,7 @@ using rgb_matrix::FrameCanvas;
 using rgb_matrix::RGBMatrix;
 using rgb_matrix::StreamWriter;
 using rgb_matrix::StreamIO;
+typedef int64_t tmillis_t;
 
 volatile bool interrupt_received = false;
 static void InterruptHandler(int) {
@@ -58,6 +60,12 @@ void CopyFrame(AVFrame *pFrame, FrameCanvas *canvas) {
   }
 }
 
+static tmillis_t GetTimeInMillis() {
+  struct timeval tp;
+  gettimeofday(&tp, NULL);
+  return tp.tv_sec * 1000 + tp.tv_usec / 1000;
+}
+
 static int usage(const char *progname) {
   fprintf(stderr, "usage: %s [options] <video>\n", progname);
   fprintf(stderr, "Options:\n"
@@ -65,6 +73,7 @@ static int usage(const char *progname) {
           "\t-L                 : Large display, in which each chain is 'folded down'\n"
           "\t                     in the middle in an U-arrangement to get more vertical space.\n"
           "\t-R<angle>          : Rotate output; steps of 90 degrees\n"
+          "\t-r<repeat-secs>    : Repeat for at least n seconds\n"
           "\t-v                 : verbose.\n");
 
   fprintf(stderr, "\nGeneral LED matrix options:\n");
@@ -83,10 +92,11 @@ int main(int argc, char *argv[]) {
   bool large_display = false;  // 64x64 made out of 4 in sequence.
   int angle = -361;
   bool verbose = false;
+  int repeatSeconds = 0;
   const char *stream_output = NULL;
 
   int opt;
-  while ((opt = getopt(argc, argv, "vO:R:L")) != -1) {
+  while ((opt = getopt(argc, argv, "vO:R:r:L")) != -1) {
     switch (opt) {
     case 'v':
       verbose = true;
@@ -103,6 +113,9 @@ int main(int argc, char *argv[]) {
       break;
     case 'R':
       angle = atoi(optarg);
+      break;
+    case 'r':
+      repeatSeconds = atoi(optarg);
       break;
 
     default:
@@ -253,33 +266,37 @@ int main(int argc, char *argv[]) {
   signal(SIGINT, InterruptHandler);
 
   const int frame_wait_micros = 1e6 / fps;
-  while (!interrupt_received && av_read_frame(pFormatCtx, &packet) >= 0) {
-    // Is this a packet from the video stream?
-    if (packet.stream_index==videoStream) {
-      // Decode video frame
-      avcodec_decode_video2(pCodecCtx, pFrame, &frameFinished, &packet);
+  
+  const tmillis_t startPlay = GetTimeInMillis();
+  do {
+    while (!interrupt_received && av_read_frame(pFormatCtx, &packet) >= 0) {
+      // Is this a packet from the video stream?
+      if (packet.stream_index==videoStream) {
+        // Decode video frame
+        avcodec_decode_video2(pCodecCtx, pFrame, &frameFinished, &packet);
 
-      // Did we get a video frame?
-      if (frameFinished) {
-        // Convert the image from its native format to RGB
-        sws_scale(sws_ctx, (uint8_t const * const *)pFrame->data,
-                  pFrame->linesize, 0, pCodecCtx->height,
-                  pFrameRGB->data, pFrameRGB->linesize);
+        // Did we get a video frame?
+        if (frameFinished) {
+          // Convert the image from its native format to RGB
+          sws_scale(sws_ctx, (uint8_t const * const *)pFrame->data,
+                    pFrame->linesize, 0, pCodecCtx->height,
+                    pFrameRGB->data, pFrameRGB->linesize);
 
-        CopyFrame(pFrameRGB, offscreen_canvas);
-        frame_count++;
-        if (stream_writer) {
-          stream_writer->Stream(*offscreen_canvas, frame_wait_micros);
-        } else {
-          offscreen_canvas = matrix->SwapOnVSync(offscreen_canvas);
+          CopyFrame(pFrameRGB, offscreen_canvas);
+          frame_count++;
+          if (stream_writer) {
+            stream_writer->Stream(*offscreen_canvas, frame_wait_micros);
+          } else {
+            offscreen_canvas = matrix->SwapOnVSync(offscreen_canvas);
+          }
         }
+        if (!stream_writer) usleep(frame_wait_micros);
       }
-      if (!stream_writer) usleep(frame_wait_micros);
-    }
 
-    // Free the packet that was allocated by av_read_frame
-    av_free_packet(&packet);
-  }
+      // Free the packet that was allocated by av_read_frame
+      av_free_packet(&packet);
+    }
+  } while ((GetTimeInMillis() - startPlay) < repeatSeconds);
 
   if (interrupt_received) {
     // Feedback for Ctrl-C, but most importantly, force a newline
