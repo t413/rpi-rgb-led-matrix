@@ -172,7 +172,7 @@ int main(int argc, char *argv[]) {
   av_register_all();
   avformat_network_init();
 
-  for (int imgarg = optind; imgarg < argc; ++imgarg) {
+  for (int imgarg = optind; imgarg < argc && !interrupt_received; ++imgarg) {
     const char *movie_file = argv[imgarg];
 
     // Open video file

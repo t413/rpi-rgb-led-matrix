@@ -30,6 +30,9 @@ static int usage(const char *progname) {
           "\t-C <r,g,b>        : Color. Default 255,255,0\n"
           "\t-B <r,g,b>        : Background-Color. Default 0,0,0\n"
           "\t-O <r,g,b>        : Outline-Color, e.g. to increase contrast.\n"
+          "\t-R<angle>          : Rotate output; steps of 90 degrees\n"
+          "\t-L                 : Large display, in which each chain is 'folded down'\n"
+          "\t                     in the middle in an U-arrangement to get more vertical space.\n"
           );
   return 1;
 }
@@ -62,9 +65,11 @@ int main(int argc, char *argv[]) {
   int y_orig = 0;
   int brightness = 100;
   int letter_spacing = 0;
+  int angle = -361;
+  bool large_display = false;  // 64x64 made out of 4 in sequence.
 
   int opt;
-  while ((opt = getopt(argc, argv, "x:y:f:C:B:O:b:S:")) != -1) {
+  while ((opt = getopt(argc, argv, "x:y:f:C:B:O:b:S:R:L")) != -1) {
     switch (opt) {
     case 'b': brightness = atoi(optarg); break;
     case 'x': x_orig = atoi(optarg); break;
@@ -89,6 +94,14 @@ int main(int argc, char *argv[]) {
         return usage(argv[0]);
       }
       with_outline = true;
+      break;
+    case 'R':
+      angle = atoi(optarg);
+      break;
+    case 'L':
+      if (matrix_options.chain_length == 1)
+        matrix_options.chain_length = 4; // If this is still default, force the 64x64 arrangement.
+      large_display = true;
       break;
     default:
       return usage(argv[0]);
@@ -129,6 +142,12 @@ int main(int argc, char *argv[]) {
     return 1;
 
   canvas->SetBrightness(brightness);
+
+  if (angle >= -360)
+    canvas->ApplyStaticTransformer(rgb_matrix::RotateTransformer(angle));
+  if (large_display)
+    canvas->ApplyStaticTransformer(rgb_matrix::UArrangementTransformer(matrix_options.parallel));
+
 
   const bool all_extreme_colors = (brightness == 100)
       && FullSaturation(color)
