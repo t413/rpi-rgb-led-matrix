@@ -54,6 +54,7 @@ void Thread::Start(int priority, uint32_t affinity_mask) {
     }
   }
 
+#ifdef __linux__
   if (affinity_mask != 0) {
     cpu_set_t cpu_mask;
     CPU_ZERO(&cpu_mask);
@@ -67,6 +68,7 @@ void Thread::Start(int priority, uint32_t affinity_mask) {
       //        affinity_mask, strerror(err));
     }
   }
+#endif
 
   started_ = true;
 }
